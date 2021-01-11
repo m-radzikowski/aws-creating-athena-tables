@@ -1,0 +1,310 @@
+service: athenaTables
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-s3-deploy
+  - serverless-s3-remover
+
+custom:
+  project: betterdev
+  baseName: ${self:custom.project}-${self:provider.stage}-${self:service}
+
+  # upload Glue script to bucket on deploy
+  assets:
+    auto: true
+    targets:
+      - bucket: !Ref ProductsBucket
+        files:
+          - source: ./src/products
+            globs: fetch_products.py
+
+  # clean buckets on stack removal
+  remover:
+    buckets:
+      - ${cf:${self:custom.baseName}.ProductsBucketName, ''}
+      - ${cf:${self:custom.baseName}.TransactionsBucketName, ''}
+      - ${cf:${self:custom.baseName}.SalesBucketName, ''}
+
+provider:
+  name: aws
+  stage: ${opt:stage, 'dev'}
+  stackName: ${self:custom.baseName}
+  memorySize: 256
+  timeout: 60
+
+functions:
+  transactionsGenerator:
+    handler: src/transactions/index.handler
+    events:
+      - schedule: rate(1 minute)
+    environment:
+      FIREHOSE_NAME: !Ref TransactionsFirehose
+    iamRoleStatementsName: ${self:custom.baseName}-transactionsGeneratorRole
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - firehose:PutRecordBatch
+        Resource: !GetAtt TransactionsFirehose.Arn
+
+  salesQueryRunner:
+    handler: src/sales/index.handler
+    events:
+      - schedule: rate(1 minute)
+    environment:
+      BUCKET_NAME: !Ref SalesBucket
+      DATABASE_NAME: !Ref GlueDatabase
+    iamRoleStatementsName: ${self:custom.baseName}-salesQueryRunner
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - glue:GetTable
+          - glue:GetTables
+          - glue:GetPartition
+          - glue:GetPartitions
+          - glue:CreateTable
+          - glue:CreatePartition
+          - glue:BatchCreatePartition
+        Resource:
+          - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+          - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+          - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*
+      - Effect: Allow
+        Action:
+          - athena:StartQueryExecution
+          - athena:GetQueryExecution
+        Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary
+      - Effect: Allow
+        Action:
+          - s3:GetBucketLocation
+          - s3:GetObject
+          - s3:ListBucket
+          - s3:ListBucketMultipartUploads
+          - s3:ListMultipartUploadParts
+          - s3:AbortMultipartUpload
+          - s3:PutObject
+        Resource:
+          - !Sub ${SalesBucket.Arn}
+          - !Sub ${SalesBucket.Arn}/*
+      - Effect: Allow
+        Action:
+          - s3:GetBucketLocation
+          - s3:GetObject
+          - s3:ListBucket
+        Resource:
+          - !Sub ${ProductsBucket.Arn}
+          - !Sub ${ProductsBucket.Arn}/*
+          - !Sub ${TransactionsBucket.Arn}
+          - !Sub ${TransactionsBucket.Arn}/*
+
+resources:
+  Resources:
+
+    GlueDatabase:
+      Type: AWS::Glue::Database
+      Properties:
+        CatalogId: !Ref AWS::AccountId
+        DatabaseInput:
+          Name: athenatables-${self:provider.stage}
+
+    # Products dataset
+
+    FetchProductsGlueJob:
+      Type: AWS::Glue::Job
+      Properties:
+        Name: ${self:custom.baseName}-fetchProducts
+        Command:
+          Name: pythonshell
+          PythonVersion: 3
+          ScriptLocation: !Sub s3://${ProductsBucket}/fetch_products.py
+        DefaultArguments:
+          '--target-bucket-name': !Ref ProductsBucket
+        GlueVersion: '1.0'
+        MaxCapacity: 0.0625
+        Timeout: 5
+        ExecutionProperty:
+          MaxConcurrentRuns: 5
+        Role: !Ref FetchProductsJobRole
+
+    FetchProductsJobTrigger:
+      Type: AWS::Glue::Trigger
+      Properties:
+        Name: ${self:custom.baseName}-fetchProductsJob
+        Type: SCHEDULED
+        StartOnCreation: true
+        Actions:
+          - JobName: !Ref FetchProductsGlueJob
+        Schedule: cron(* * * * ? *)
+
+    ProductsCrawler:
+      Type: AWS::Glue::Crawler
+      Properties:
+        Name: ${self:custom.baseName}-products
+        DatabaseName: !Ref GlueDatabase
+        Role: !GetAtt ProductsCrawlerRole.Arn
+        Targets:
+          S3Targets:
+            - Path: !Sub s3://${ProductsBucket}/products
+        Configuration: >
+          {
+            "Version": 1.0,
+            "Grouping": {
+              "TableGroupingPolicy": "CombineCompatibleSchemas"
+            }
+          }
+
+    FetchProductsCrawlerTrigger:
+      Type: AWS::Glue::Trigger
+      Properties:
+        Name: ${self:custom.baseName}-productsCrawler
+        Type: CONDITIONAL
+        StartOnCreation: true
+        Actions:
+          - CrawlerName: !Ref ProductsCrawler
+        Predicate:
+          Conditions:
+            - JobName: !Ref FetchProductsGlueJob
+              LogicalOperator: EQUALS
+              State: SUCCEEDED
+
+    ProductsBucket:
+      Type: AWS::S3::Bucket
+
+    FetchProductsJobRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: glue.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        Policies:
+          - PolicyName: s3
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                  Resource: !Sub ${ProductsBucket.Arn}/fetch_products.py
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                  Resource: !Sub ${ProductsBucket.Arn}/products/*
+
+    ProductsCrawlerRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: glue.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        Policies:
+          - PolicyName: s3
+            PolicyDocument:
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                    - s3:GetObject
+                  Resource:
+                    - !Sub ${ProductsBucket.Arn}
+                    - !Sub ${ProductsBucket.Arn}/*
+
+    # Transactions dataset
+
+    TransactionsFirehose:
+      Type: AWS::KinesisFirehose::DeliveryStream
+      Properties:
+        DeliveryStreamType: DirectPut
+        S3DestinationConfiguration:
+          BucketARN: !GetAtt TransactionsBucket.Arn
+          BufferingHints:
+            IntervalInSeconds: 60
+          CompressionFormat: UNCOMPRESSED
+          Prefix: !Sub ${TransactionsTable}/!{timestamp:yyyy/MM/dd/HH/mm}/
+          ErrorOutputPrefix: !Sub ${TransactionsTable}-errors/!{firehose:error-output-type}/!{timestamp:yyyy/MM/dd/HH/mm}/
+          RoleARN: !GetAtt TransactionsFirehoseRole.Arn
+
+    TransactionsFirehoseRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: firehose.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: s3
+            PolicyDocument:
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:AbortMultipartUpload
+                    - s3:GetBucketLocation
+                    - s3:GetObject
+                    - s3:ListBucket
+                    - s3:ListBucketMultipartUploads
+                    - s3:PutObject
+                  Resource:
+                    - !Sub ${TransactionsBucket.Arn}
+                    - !Sub ${TransactionsBucket.Arn}/*
+
+    TransactionsBucket:
+      Type: AWS::S3::Bucket
+
+    TransactionsTable:
+      Type: AWS::Glue::Table
+      Properties:
+        CatalogId: !Ref AWS::AccountId
+        DatabaseName: !Ref GlueDatabase
+        TableInput:
+          Name: transactions
+          TableType: EXTERNAL_TABLE
+          Parameters:
+            projection.enabled: true
+            projection.datetime.type: date
+            projection.datetime.range: '2021/01/01/00/00,NOW'
+            projection.datetime.format: 'yyyy/MM/dd/HH/mm'
+            projection.datetime.interval: 1
+            projection.datetime.interval.unit: MINUTES
+            storage.location.template: !Join [ '', [ 's3://', !Ref TransactionsBucket, '/transactions/$', '{datetime}' ] ]
+          PartitionKeys:
+            - Name: datetime
+              Type: string
+          StorageDescriptor:
+            Location: !Sub s3://${TransactionsBucket}/transactions/
+            InputFormat: org.apache.hadoop.mapred.TextInputFormat
+            OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+            SerdeInfo:
+              SerializationLibrary: org.apache.hive.hcatalog.data.JsonSerDe
+            Columns:
+              - Name: id
+                Type: varchar(64)
+              - Name: product_id
+                Type: varchar(64)
+              - Name: created_at
+                Type: timestamp
+
+    # Sales dataset
+
+    SalesBucket:
+      Type: AWS::S3::Bucket
+
+  Outputs:
+    ProductsBucketName:
+      Value: !Ref ProductsBucket
+    TransactionsBucketName:
+      Value: !Ref TransactionsBucket
+    SalesBucketName:
+      Value: !Ref SalesBucket
